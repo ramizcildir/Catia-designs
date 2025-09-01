@@ -1,0 +1,526 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+elbow_part_builder.py
+
+Create a parametric 3D approximation (triangular mesh) of a flanged elbow / mounting part
+similar to the drawing you provided. This script constructs:
+  - main vertical cylindrical boss
+  - top flange with bolt holes
+  - side pipe (cylindrical) connected via an approximated torus elbow segment
+  - mounting pad (ear/plate) with bolt hole
+  - small fillet approximations via blended vertices sampling
+
+Outputs:
+  - elbow_part_approx.stl  (ASCII STL)
+  - elbow_part_approx.obj  (Wavefront OBJ)
+  - 3D matplotlib plot of the assembled mesh
+
+Dependencies: numpy, matplotlib
+
+Author: Phython Programming Tutor
+Date: 2025-09
+"""
+from dataclasses import dataclass
+import numpy as np
+import math
+import sys
+import os
+from typing import Tuple, List
+
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (used implicitly)
+
+# ------------------------------------------------------------
+# Utility mesh routines (triangular mesh in simple arrays)
+# Mesh represented by:
+#   vertices : (N,3) float array
+#   triangles: (M,3) int array (indices into vertices)
+# ------------------------------------------------------------
+
+def write_stl_ascii(path: str, verts: np.ndarray, tris: np.ndarray, name: str = "part"):
+    """Write a simple ASCII STL file from verts/tris."""
+    with open(path, 'w') as f:
+        f.write(f"solid {name}\n")
+        for tri in tris:
+            p0 = verts[tri[0]]
+            p1 = verts[tri[1]]
+            p2 = verts[tri[2]]
+            # compute normal
+            n = np.cross(p1 - p0, p2 - p0)
+            norm = np.linalg.norm(n)
+            if norm < 1e-12:
+                nx, ny, nz = 0.0, 0.0, 0.0
+            else:
+                nx, ny, nz = n / norm
+            f.write(f"  facet normal {nx:.6e} {ny:.6e} {nz:.6e}\n")
+            f.write("    outer loop\n")
+            f.write(f"      vertex {p0[0]:.6e} {p0[1]:.6e} {p0[2]:.6e}\n")
+            f.write(f"      vertex {p1[0]:.6e} {p1[1]:.6e} {p1[2]:.6e}\n")
+            f.write(f"      vertex {p2[0]:.6e} {p2[1]:.6e} {p2[2]:.6e}\n")
+            f.write("    endloop\n")
+            f.write("  endfacet\n")
+        f.write(f"endsolid {name}\n")
+    print(f"Wrote STL: {path}")
+
+def write_obj(path: str, verts: np.ndarray, tris: np.ndarray):
+    """Write a simple Wavefront OBJ file."""
+    with open(path, 'w') as f:
+        for v in verts:
+            f.write(f"v {v[0]:.6e} {v[1]:.6e} {v[2]:.6e}\n")
+        for t in tris:
+            # OBJ uses 1-based indexing
+            f.write(f"f {t[0]+1} {t[1]+1} {t[2]+1}\n")
+    print(f"Wrote OBJ: {path}")
+
+
+def merge_meshes(mesh_list: List[Tuple[np.ndarray, np.ndarray]], tol=1e-9) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Merge multiple (verts, tris) meshes into one, deduplicate vertices within tolerance.
+    Returns merged (verts, tris).
+    """
+    if not mesh_list:
+        return np.zeros((0, 3)), np.zeros((0, 3), dtype=int)
+
+    all_verts = np.vstack([m[0] for m in mesh_list])
+    offsets = []
+    current = 0
+    for m in mesh_list:
+        offsets.append(current)
+        current += m[0].shape[0]
+    all_tris = np.vstack([m[1] + off for m, off in zip(mesh_list, offsets)])
+
+    # Deduplicate vertices by hashing rounded coordinates
+    if all_verts.shape[0] == 0:
+        return all_verts, all_tris
+    key = np.round(all_verts / tol).astype(np.int64)
+    # Build mapping
+    unique_rows, inv_idx = np.unique(key, axis=0, return_inverse=True)
+    new_verts = unique_rows.astype(float) * tol
+    new_tris = inv_idx[all_tris]
+    # new_tris needs shape (M,3)
+    new_tris = new_tris.reshape((-1, 3))
+    return new_verts, new_tris
+
+# ------------------------------------------------------------
+# Primitive surface mesh generators
+# ------------------------------------------------------------
+
+def sample_circle(radius: float, z: float, segments: int) -> np.ndarray:
+    """Return (segments,3) points around circle in XY plane at height z."""
+    theta = np.linspace(0, 2 * np.pi, segments, endpoint=False)
+    return np.column_stack([radius * np.cos(theta), radius * np.sin(theta), np.full_like(theta, z)])
+
+def make_cylinder_mesh(radius: float, z0: float, z1: float, radial_segments: int = 64, cap_ends: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Create a triangulated *hollow* cylindrical shell (no solid interior).
+    Returns (verts, tris) representing triangulated surface of cylinder between z0 and z1.
+    If cap_ends=True, end-caps are added (disks triangulated).
+    """
+    # Generate rings
+    ring0 = sample_circle(radius, z0, radial_segments)
+    ring1 = sample_circle(radius, z1, radial_segments)
+    verts = np.vstack([ring0, ring1])
+    tris = []
+    for i in range(radial_segments):
+        i0 = i
+        i1 = (i + 1) % radial_segments
+        a = i0
+        b = i1
+        c = radial_segments + i0
+        d = radial_segments + i1
+        # two triangles per quad
+        tris.append([a, b, d])
+        tris.append([a, d, c])
+    # add end caps
+    if cap_ends:
+        center0 = np.array([[0.0, 0.0, z0]])
+        center1 = np.array([[0.0, 0.0, z1]])
+        base0_idx = verts.shape[0]
+        verts = np.vstack([verts, center0, center1])
+        c0_index = base0_idx
+        c1_index = base0_idx + 1
+        for i in range(radial_segments):
+            i0 = i
+            i1 = (i + 1) % radial_segments
+            # cap at z0 (center pointing down or up doesn't matter for STL)
+            tris.append([c0_index, i1, i0])
+            # cap at z1
+            tris.append([c1_index, radial_segments + i0, radial_segments + i1])
+    return np.array(verts), np.array(tris, dtype=int)
+
+def make_disk_mesh(radius: float, z: float, radial_segments: int = 48) -> Tuple[np.ndarray, np.ndarray]:
+    """Triangulate a flat disk in XY plane at z."""
+    rim = sample_circle(radius, z, radial_segments)
+    center = np.array([[0.0, 0.0, z]])
+    verts = np.vstack([rim, center])
+    center_idx = verts.shape[0] - 1
+    tris = []
+    for i in range(radial_segments):
+        i0 = i
+        i1 = (i + 1) % radial_segments
+        tris.append([center_idx, i1, i0])
+    return verts, np.array(tris, dtype=int)
+
+def make_annulus_mesh(r_outer: float, r_inner: float, z: float, radial_segments: int = 64) -> Tuple[np.ndarray, np.ndarray]:
+    """Triangulate an annulus (flat ring) between r_inner and r_outer at height z."""
+    theta = np.linspace(0, 2*np.pi, radial_segments, endpoint=False)
+    outer = np.column_stack([r_outer * np.cos(theta), r_outer * np.sin(theta), np.full_like(theta, z)])
+    inner = np.column_stack([r_inner * np.cos(theta), r_inner * np.sin(theta), np.full_like(theta, z)])
+    verts = np.vstack([outer, inner])
+    tris = []
+    for i in range(radial_segments):
+        a = i
+        b = (i + 1) % radial_segments
+        c = radial_segments + i
+        d = radial_segments + ((i + 1) % radial_segments)
+        # quad between outer and inner rings
+        tris.append([a, b, d])
+        tris.append([a, d, c])
+    return verts, np.array(tris, dtype=int)
+
+def make_torus_segment(R_major: float, r_minor: float, phi0: float, phi1: float, n_major: int = 80, n_minor: int = 20) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Make a torus segment (a curved pipe elbow) parametrized by major radius R_major and minor radius r_minor.
+    phi0..phi1 in radians.
+    """
+    phis = np.linspace(phi0, phi1, n_major)
+    thetas = np.linspace(0, 2*np.pi, n_minor, endpoint=False)
+    verts = []
+    for phi in phis:
+        center_x = R_major * math.cos(phi)
+        center_y = R_major * math.sin(phi)
+        for theta in thetas:
+            x = (R_major + r_minor * math.cos(theta)) * math.cos(phi)
+            y = (R_major + r_minor * math.cos(theta)) * math.sin(phi)
+            z = r_minor * math.sin(theta)
+            verts.append([x, y, z])
+    verts = np.array(verts)
+    tris = []
+    M = n_major
+    N = n_minor
+    for i in range(M - 1):
+        for j in range(N):
+            a = i*N + j
+            b = i*N + ((j+1) % N)
+            c = (i+1)*N + ((j+1) % N)
+            d = (i+1)*N + j
+            tris.append([a, b, c])
+            tris.append([a, c, d])
+    # Note: not closing the ends (open ends) — caller can cap if needed.
+    return verts, np.array(tris, dtype=int)
+
+
+def rotate_mesh(verts: np.ndarray, axis: np.ndarray, angle_rad: float) -> np.ndarray:
+    """Rotate vertices around the origin by axis (3-vector) and angle (radians)."""
+    axis = np.asarray(axis, dtype=float)
+    axis = axis / (np.linalg.norm(axis) + 1e-30)
+    ux, uy, uz = axis
+    c = math.cos(angle_rad)
+    s = math.sin(angle_rad)
+    R = np.array([
+        [c + ux*ux*(1-c),     ux*uy*(1-c) - uz*s, ux*uz*(1-c) + uy*s],
+        [uy*ux*(1-c) + uz*s,  c + uy*uy*(1-c),    uy*uz*(1-c) - ux*s],
+        [uz*ux*(1-c) - uy*s,  uz*uy*(1-c) + ux*s, c + uz*uz*(1-c)]
+    ])
+    return verts.dot(R.T)
+
+def translate_mesh(verts: np.ndarray, shift: Tuple[float, float, float]) -> np.ndarray:
+    """Translate mesh vertices by shift."""
+    return verts + np.array(shift, dtype=float).reshape((1, 3))
+
+
+# ------------------------------------------------------------
+# High-level part builder (parametric)
+# ------------------------------------------------------------
+
+@dataclass
+class ElbowParams:
+    # main boss and pipe
+    main_pipe_radius: float = 32.0  # R_main pipe inner/outside approximations (mm)
+    main_pipe_length: float = 64.0  # length of vertical boss
+    wall_thickness: float = 6.0     # thickness of pipe wall (approx)
+    # flange
+    flange_outer_dia: float = 84.0
+    flange_thickness: float = 10.0
+    flange_bolt_diameter: float = 12.0
+    flange_bolt_circle: float = 56.0 / 2.0  # radius for bolt circle (using drawing's M56 => 56 mm? adapt)
+    n_bolt_holes: int = 4
+    # side pipe & elbow
+    side_pipe_radius: float = 20.0
+    elbow_center_radius: float = 48.0  # distance from pipe center to elbow center (bend radius)
+    elbow_angle_deg: float = 120.0      # how much the elbow turns
+    elbow_thickness: float = 6.0
+    # mounting pad (ear)
+    pad_width: float = 30.0
+    pad_length: float = 80.0
+    pad_thickness: float = 8.0
+    pad_hole_dia: float = 10.0
+    pad_offset: float = -35.0  # lateral offset from main axis (y-direction)
+    # sampling/resolution controls
+    radial_segments: int = 64
+    minor_segments: int = 18
+    torus_major_segments: int = 60
+    torus_minor_segments: int = 20
+
+def build_elbow_mesh(p: ElbowParams) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Build an assembled mesh approximating the flanged elbow part.
+    Approach: build components centered at origin and translate/rotate into place.
+    We will construct:
+      - main outer cylinder (solid surface)
+      - inner hollow cylinder (negative) is not subtracted: we keep shell
+      - top flange (annulus)
+      - flange bolt holes are modelled as thin cylinders (we'll carve by overlapping)
+      - side pipe cylinder
+      - torus elbow connecting centers
+      - mounting pad (box + hole)
+    Because we are not performing Boolean subtraction, the meshes will overlap; merged mesh is still valid for STL.
+    """
+    meshes = []
+
+    # MAIN vertical pipe (outer shell)
+    R_outer = p.main_pipe_radius + p.wall_thickness/2.0
+    R_inner = max(0.1, p.main_pipe_radius - p.wall_thickness/2.0)
+    z0 = 0.0
+    z1 = p.main_pipe_length
+    cyl_outer, tri_outer = make_cylinder_mesh(R_outer, z0, z1, radial_segments=p.radial_segments, cap_ends=False)
+    cyl_inner, tri_inner = make_cylinder_mesh(R_inner, z0, z1, radial_segments=p.radial_segments, cap_ends=False)
+    # Translate main pipe so its bottom is near z=0 (already z0=0)
+    # We'll keep both shells (outer and inner) to visually show thickness
+    meshes.append((cyl_outer, tri_outer))
+    meshes.append((cyl_inner, tri_inner))
+
+    # TOP flange: an annulus at top z1
+    flange_outer_r = p.flange_outer_dia / 2.0
+    flange_inner_r = R_outer + 0.5  # small transition
+    flange_z0 = z1
+    flange_verts, flange_tris = make_annulus_mesh(flange_outer_r, flange_inner_r, flange_z0, radial_segments=p.radial_segments)
+    # extrude flange thickness by duplicating annulus at z=flange_z0+thickness and connecting
+    flange_top_verts = flange_verts.copy()
+    flange_bottom_verts = flange_verts.copy()
+    # separate top and bottom rings
+    flange_bottom_verts[:, 2] = flange_z0
+    flange_top_verts[:, 2] = flange_z0 + p.flange_thickness
+    # connect rings
+    verts = np.vstack([flange_bottom_verts, flange_top_verts])
+    tris = []
+    N = flange_bottom_verts.shape[0]
+    for i in range(N):
+        a = i
+        b = (i + 1) % N
+        c = N + ((i + 1) % N)
+        d = N + i
+        tris.append([a, b, c])
+        tris.append([a, c, d])
+    meshes.append((verts, np.array(tris, dtype=int)))
+
+    # flange bolt holes: model as small through-cylinders (we won't subtract; they will overlap)
+    bolt_radius = p.flange_bolt_diameter / 2.0
+    bolt_depth = p.flange_thickness + 6.0
+    for i in range(p.n_bolt_holes):
+        ang = 2 * np.pi * i / p.n_bolt_holes
+        bx = p.flange_bolt_circle * math.cos(ang)
+        by = p.flange_bolt_circle * math.sin(ang)
+        # Build bolt hole cylinder along z (through flange)
+        cyl_bolt, tris_bolt = make_cylinder_mesh(bolt_radius, flange_z0 - 2.0, flange_z0 + bolt_depth - 2.0, radial_segments=24, cap_ends=False)
+        cyl_bolt = translate_mesh(cyl_bolt, (bx, by, 0.0))
+        meshes.append((cyl_bolt, tris_bolt))
+
+    # SIDE pipe: horizontal cylinder along +X direction that will be connected by torus elbow
+    side_R_outer = p.side_pipe_radius + p.elbow_thickness / 2.0
+    side_R_inner = max(0.1, p.side_pipe_radius - p.elbow_thickness / 2.0)
+    side_length = 80.0
+    # We'll create the side cylinder at origin along Z then rotate into X later
+    cyl_side, tri_side = make_cylinder_mesh(side_R_outer, -side_length/2.0, side_length/2.0, radial_segments=48, cap_ends=False)
+    # Rotate cylinder so its axis is X: currently axis along Z (because we built along z). rotate about Y by 90 deg
+    cyl_side = rotate_mesh(cyl_side, axis=(0,1,0), angle_rad=-math.pi/2.0)
+    meshes.append((translate_mesh(cyl_side, (p.elbow_center_radius + p.main_pipe_radius/2.0, 0.0, p.main_pipe_length/2.0)), tri_side))
+
+    # Torus elbow connecting centers: a torus of major radius elbow_center_radius and minor radius equal to side pipe radius + thickness/2
+    # Place torus in XY plane bent from approx -90 deg to 30 deg (depending on elbow_angle_deg), then translate to match centers
+    phi0 = math.radians(-90.0)
+    phi1 = phi0 + math.radians(p.elbow_angle_deg)
+    torus_R = p.elbow_center_radius
+    torus_r = p.side_pipe_radius + p.elbow_thickness/2.0
+    tor_verts, tor_tris = make_torus_segment(torus_R, tor_r, phi0, phi1, n_major=p.torus_major_segments, n_minor=p.torus_minor_segments)
+    # Torus is currently centered around origin in XY plane; we want its mid-plane to align with main pipe at y=0 and z ~ main_pipe_length/2
+    # The torus center lies in XY plane; shift in Z by main pipe center height and in XY to align
+    # We'll shift so that the inner connection of torus meets the main pipe side at approx (main_pipe_radius, 0, main_pipe_length/2)
+    # For simplicity, shift torus upward by main_pipe_length/2
+    torus_shift = (0.0, 0.0, p.main_pipe_length/2.0)
+    tor_verts = translate_mesh(tor_verts, torus_shift)
+    meshes.append((tor_verts, tor_tris))
+
+    # Mounting pad (ear): a rectangular plate extruded with a circular hole
+    pad_len = p.pad_length
+    pad_w = p.pad_width
+    pad_th = p.pad_thickness
+    pad_center_x = p.pad_offset  # shift along X or Y to place under elbow (we choose X negative)
+    # We'll create a thin box (plate) in XY plane at z ~ pad_height
+    pad_z_bottom = -pad_th/2.0 + 8.0  # put it below the main assembly slightly
+    pad_z_top = pad_z_bottom + pad_th
+    # Create rectangle ring (two rectangles stacked and connected)
+    # Build 8 vertices (rectangle bottom and top) and triangulate faces
+    # For simplicity we create a plate approximated as a thin box centered near x = -pad_offset (left of main)
+    rect_cx = - (p.main_pipe_radius + pad_len/2.0)  # place under main pipe left side
+    rect_cy = 0.0
+    rx = pad_len/2.0
+    ry = pad_w/2.0
+    # create 8 corners bottom/top
+    corners = np.array([
+        [rect_cx - rx, rect_cy - ry, pad_z_bottom],
+        [rect_cx + rx, rect_cy - ry, pad_z_bottom],
+        [rect_cx + rx, rect_cy + ry, pad_z_bottom],
+        [rect_cx - rx, rect_cy + ry, pad_z_bottom],
+        [rect_cx - rx, rect_cy - ry, pad_z_top],
+        [rect_cx + rx, rect_cy - ry, pad_z_top],
+        [rect_cx + rx, rect_cy + ry, pad_z_top],
+        [rect_cx - rx, rect_cy + ry, pad_z_top],
+    ])
+    # Triangles for box surfaces (12 triangles for sides, 2 for each face)
+    tris_pad = []
+    # Bottom face (0,1,2,3)
+    tris_pad += [[0,1,2],[0,2,3]]
+    # Top face (4,6,5,4->5->6->7)
+    tris_pad += [[4,6,5],[4,7,6]]
+    # Sides
+    side_quads = [
+        (0,1,5,4),
+        (1,2,6,5),
+        (2,3,7,6),
+        (3,0,4,7)
+    ]
+    for a,b,c,d in side_quads:
+        tris_pad += [[a,b,c],[a,c,d]]
+    meshes.append((corners, np.array(tris_pad, dtype=int)))
+
+    # Pad hole: small cylinder through plate
+    hole_r = p.pad_hole_dia/2.0
+    hole_depth = pad_th + 2.0
+    hole_cx = rect_cx
+    hole_cy = 0.0
+    cyl_hole, tri_hole = make_cylinder_mesh(hole_r, pad_z_bottom - 1.0, pad_z_top + 1.0, radial_segments=24, cap_ends=False)
+    cyl_hole = translate_mesh(cyl_hole, (hole_cx, hole_cy, 0.0))
+    meshes.append((cyl_hole, tri_hole))
+
+    # Small chamfers / fillet approximations: add small spheres at key corner points (optional)
+    # Build small sphere discretization function
+    def make_sphere(center, radius, n_lon=12, n_lat=12):
+        verts_s = []
+        tris_s = []
+        lon = np.linspace(0, 2*np.pi, n_lon, endpoint=False)
+        lat = np.linspace(0, np.pi, n_lat)
+        for i, phi in enumerate(lat):
+            for j, theta in enumerate(lon):
+                x = center[0] + radius * math.sin(phi) * math.cos(theta)
+                y = center[1] + radius * math.sin(phi) * math.sin(theta)
+                z = center[2] + radius * math.cos(phi)
+                verts_s.append([x,y,z])
+        verts_s = np.array(verts_s)
+        # connectivity
+        for i in range(n_lat-1):
+            for j in range(n_lon):
+                a = i*n_lon + j
+                b = i*n_lon + ((j+1)%n_lon)
+                c = (i+1)*n_lon + ((j+1)%n_lon)
+                d = (i+1)*n_lon + j
+                tris_s.append([a,b,c])
+                tris_s.append([a,c,d])
+        return verts_s, np.array(tris_s, dtype=int)
+    # Add one small sphere near junction for visual smoothness (not true fillet)
+    sph_v, sph_t = make_sphere((0.0, p.main_pipe_radius, p.main_pipe_length*0.6), radius=3.0, n_lon=12, n_lat=8)
+    meshes.append((sph_v, sph_t))
+
+    # Merge meshes into single mesh
+    merged_verts, merged_tris = merge_meshes(meshes, tol=1e-6)
+    # Optionally translate whole assembly so base sits on z=0 and centered nicely
+    # compute min z
+    minz = merged_verts[:,2].min()
+    merged_verts[:,2] -= minz  # shift up so min z == 0
+
+    return merged_verts, merged_tris
+
+# ------------------------------------------------------------
+# Visualization helper
+# ------------------------------------------------------------
+
+def plot_mesh_matplotlib(verts: np.ndarray, tris: np.ndarray, show=True, elev=20, azim=-60):
+    """Simple 3D plot using matplotlib's Poly3DCollection."""
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    fig = plt.figure(figsize=(10,8))
+    ax = fig.add_subplot(111, projection='3d')
+    # build faces
+    faces = [verts[t] for t in tris]
+    coll = Poly3DCollection(faces, linewidths=0.05, alpha=0.85)
+    # color shading based on Z (simple)
+    face_z = np.array([face[:,2].mean() for face in faces])
+    face_z_norm = (face_z - face_z.min()) / (face_z.ptp() + 1e-12)
+    # colormap
+    import matplotlib.cm as cm
+    coll.set_facecolor(cm.viridis(0.2 + 0.7*face_z_norm))
+    coll.set_edgecolor((0.0, 0.0, 0.0, 0.05))
+    ax.add_collection3d(coll)
+
+    # autoscale
+    max_range = (verts.max(axis=0) - verts.min(axis=0)).max()
+    mid = (verts.max(axis=0) + verts.min(axis=0)) / 2.0
+    ax.set_xlim(mid[0]-max_range/2, mid[0]+max_range/2)
+    ax.set_ylim(mid[1]-max_range/2, mid[1]+max_range/2)
+    ax.set_zlim(0, mid[2]+max_range/2)
+
+    ax.set_xlabel('X (mm)')
+    ax.set_ylabel('Y (mm)')
+    ax.set_zlabel('Z (mm)')
+    ax.view_init(elev=elev, azim=azim)
+    ax.set_title('Elbow part (approximate triangular surface mesh)')
+    plt.tight_layout()
+    if show:
+        plt.show()
+    return fig, ax
+
+# ------------------------------------------------------------
+# Main entry
+# ------------------------------------------------------------
+
+def main():
+    # Parameters roughly following drawing proportions; tweak as needed.
+    p = ElbowParams(
+        main_pipe_radius=32.0,
+        main_pipe_length=80.0,
+        wall_thickness=8.0,
+        flange_outer_dia=84.0,
+        flange_thickness=12.0,
+        flange_bolt_diameter=12.0,
+        flange_bolt_circle=28.0,  # radius = 28 (i.e., 56mm dia)
+        n_bolt_holes=4,
+        side_pipe_radius=20.0,
+        elbow_center_radius=48.0,
+        elbow_angle_deg=120.0,
+        elbow_thickness=8.0,
+        pad_width=36.0,
+        pad_length=80.0,
+        pad_thickness=8.0,
+        pad_hole_dia=12.0,
+        pad_offset=-36.0,
+        radial_segments=80,
+        minor_segments=20,
+        torus_major_segments=80,
+        torus_minor_segments=20
+    )
+
+    print("Building part mesh...")
+    verts, tris = build_elbow_mesh(p)
+    print(f"Vertices: {verts.shape[0]}, Triangles: {tris.shape[0]}")
+
+    # Write outputs
+    out_stl = "elbow_part_approx.stl"
+    out_obj = "elbow_part_approx.obj"
+    write_stl_ascii(out_stl, verts, tris, name="elbow_approx")
+    write_obj(out_obj, verts, tris)
+
+    # Plot
+    plot_mesh_matplotlib(verts, tris)
+
+if __name__ == "__main__":
+    main()
