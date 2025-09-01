@@ -1,0 +1,618 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+L-BRACKET HEAT CONDUCTION (2D FEM, LINEAR TRIANGLES)
+
+This single file:
+1) Defines a parametric 2D L-bracket polygon (you can tweak dimensions).
+2) Generates an unstructured triangular mesh via Delaunay, keeping only
+   triangles whose centroids lie inside the polygon.
+3) Assembles the FEM system for steady-state heat conduction:
+       -k * Laplacian(T) = Q
+   with Dirichlet BCs on the left (hot) and right (cold) boundaries,
+   and natural (Neumann=0, i.e., insulated) elsewhere by default.
+4) Solves the sparse linear system and visualizes temperature and heat flux.
+5) Writes nodal fields (x, y, T, |q|) to CSV.
+
+Author: Phython Programming Tutor
+"""
+
+# -----------------------------
+# Imports
+# -----------------------------
+import math
+import csv
+import sys
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+
+import numpy as np
+from scipy.spatial import Delaunay
+from scipy.sparse import coo_matrix, csr_matrix
+from scipy.sparse.linalg import spsolve
+import matplotlib.pyplot as plt
+from matplotlib.collections import PolyCollection, LineCollection
+
+# -----------------------------
+# Utilities: geometry helpers
+# -----------------------------
+
+def point_in_polygon(x: float, y: float, poly: np.ndarray) -> bool:
+    """
+    Ray-casting point-in-polygon test.
+    poly: (M, 2) array of polygon vertices in order (closed or open).
+    Returns True if the point is inside or on the boundary.
+    """
+    # Ensure poly is (M,2)
+    M = poly.shape[0]
+    inside = False
+    # Iterate edges (xi, yi)->(xj, yj)
+    j = M - 1
+    for i in range(M):
+        xi, yi = poly[i, 0], poly[i, 1]
+        xj, yj = poly[j, 0], poly[j, 1]
+        # Check if point is between yi and yj in vertical sense
+        intersect = ((yi > y) != (yj > y))
+        if intersect:
+            # x coordinate of intersection of edge with horizontal ray at y
+            x_inter = (xj - xi) * (y - yi) / (yj - yi + 1e-30) + xi
+            if x <= x_inter + 1e-14:  # count points on edge as inside
+                inside = not inside
+        j = i
+    # Extra: treat very close to boundary as inside by checking distance to edges
+    if not inside:
+        if point_on_polygon_edge((x, y), poly, tol=1e-12):
+            return True
+    return inside
+
+def point_on_segment(p, a, b, tol=1e-12) -> bool:
+    """
+    Check if point p lies on segment ab within tolerance using projection + distance.
+    """
+    px, py = p
+    ax, ay = a
+    bx, by = b
+    vx, vy = bx - ax, by - ay
+    wx, wy = px - ax, py - ay
+    seg_len2 = vx * vx + vy * vy
+    if seg_len2 < tol:
+        # a and b coincide
+        return (abs(px - ax) <= tol) and (abs(py - ay) <= tol)
+    t = (wx * vx + wy * vy) / seg_len2
+    if t < -tol or t > 1 + tol:
+        return False
+    # Closest point on AB
+    cx, cy = ax + t * vx, ay + t * vy
+    dist2 = (px - cx) ** 2 + (py - cy) ** 2
+    return dist2 <= tol * tol
+
+def point_on_polygon_edge(p, poly: np.ndarray, tol=1e-12) -> bool:
+    """
+    Return True if point p is on any edge of polygon poly within tolerance.
+    """
+    M = poly.shape[0]
+    for i in range(M):
+        a = poly[i]
+        b = poly[(i + 1) % M]
+        if point_on_segment(p, a, b, tol=tol):
+            return True
+    return False
+
+def edges_of_polygon(poly: np.ndarray) -> List[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    """
+    Return list of edges (as point pairs) for a polygon.
+    """
+    edges = []
+    for i in range(poly.shape[0]):
+        p0 = tuple(poly[i])
+        p1 = tuple(poly[(i + 1) % poly.shape[0]])
+        edges.append((p0, p1))
+    return edges
+
+def edge_midpoints(poly: np.ndarray, pts_per_edge: int) -> np.ndarray:
+    """
+    Generate evenly spaced points along polygon edges to help Delaunay honor boundaries.
+    """
+    out = []
+    for i in range(poly.shape[0]):
+        a = poly[i]
+        b = poly[(i + 1) % poly.shape[0]]
+        for t in np.linspace(0.0, 1.0, pts_per_edge, endpoint=False):
+            out.append((a * (1 - t) + b * t))
+    return np.array(out)
+
+
+# -----------------------------
+# Parametric L-bracket geometry
+# -----------------------------
+
+@dataclass
+class LBracketParams:
+    """
+    Geometry parameters for an L-shaped bracket (2D).
+    All units are arbitrary and consistent (e.g., millimeters).
+    """
+    Lx: float = 120.0   # overall width
+    Ly: float = 80.0    # overall height
+    t: float = 30.0     # thickness of the "arms"
+    r_in: float = 10.0  # inner fillet radius (optional smoothing)
+    notch: float = 0.0  # optional rectangular notch depth at inner corner
+
+def make_l_bracket_polygon(p: LBracketParams) -> np.ndarray:
+    """
+    Construct the outer polygon for an L-bracket, with an inner cutout forming the 'L'.
+    We'll return a *single* polygon representing the outside boundary of the solid region,
+    realized as a shape with a rectangular cut removed at the inner corner (not a hole list).
+    For triangulation + inside test, we will accept triangles whose centroids lie in the 'solid'.
+    """
+    # Outer rectangle (counter-clockwise)
+    x0, y0 = 0.0, 0.0
+    x1, y1 = p.Lx, p.Ly
+
+    # The inner cutout rectangle that creates the 'L'
+    cx0, cy0 = p.t, p.t
+    cx1, cy1 = p.Lx, p.Ly  # cut out the top-right big rectangle, leaving L of thickness t
+
+    # The raw polygon of the L can be described by walking around the outside.
+    # We'll include a small inner notch at the corner (optional) to demonstrate parametric tweak.
+    n = p.notch
+
+    poly = np.array([
+        [x0, y0],           # bottom-left corner
+        [x1, y0],           # bottom-right
+        [x1, p.t],          # step up by thickness
+        [p.t + n, p.t],     # go left towards inner corner (notch depth n)
+        [p.t + n, y1],      # up along inner vertical
+        [x0, y1],           # top-left
+        [x0, y0],           # back to start (closed)
+    ], dtype=float)
+
+    # Optional: inner fillet could be approximated by rounding the inside corner (p.t, p.t)
+    # For simplicity, we keep edges sharp. You can add arc points if desired.
+
+    # Ensure it's closed: last point equals first
+    if not np.allclose(poly[0], poly[-1]):
+        poly = np.vstack([poly, poly[0]])
+    return poly
+
+
+# -----------------------------
+# Mesh generation
+# -----------------------------
+
+@dataclass
+class MeshingParams:
+    """
+    Parameters controlling the point cloud and mesh density.
+    """
+    h: float = 5.0                 # target grid spacing for seeding points
+    boundary_points_per_edge: int = 20  # how many samples per polygon edge
+    jitter: float = 0.3            # randomization factor (as fraction of h)
+
+def seed_points_in_polygon(poly: np.ndarray, mp: MeshingParams) -> np.ndarray:
+    """
+    Create a set of candidate points across the bounding box of poly,
+    keep only those inside (or on) the polygon, add edge samples,
+    and add slight jitter to avoid overly structured triangulation.
+    """
+    minx, miny = poly[:, 0].min(), poly[:, 1].min()
+    maxx, maxy = poly[:, 0].max(), poly[:, 1].max()
+
+    # Regular grid of candidate points
+    xs = np.arange(minx, maxx + mp.h * 0.5, mp.h)
+    ys = np.arange(miny, maxy + mp.h * 0.5, mp.h)
+    grid = np.array([(x, y) for y in ys for x in xs], dtype=float)
+
+    # Keep inside points
+    inside_mask = np.array([point_in_polygon(x, y, poly) for (x, y) in grid], dtype=bool)
+    inside_pts = grid[inside_mask]
+
+    # Add boundary edge points for fidelity
+    edge_pts = edge_midpoints(poly, pts_per_edge=mp.boundary_points_per_edge)
+
+    # Combine and deduplicate
+    pts = np.vstack([inside_pts, edge_pts])
+    pts = unique_rows(pts)
+
+    # Add jitter (small random perturbations) but keep points inside
+    if mp.jitter > 0:
+        rng = np.random.default_rng(42)
+        perturb = (rng.random(pts.shape) - 0.5) * mp.jitter * mp.h
+        pts_jit = pts + perturb
+        # Project back inside if jitter pushed them out significantly
+        in_mask = np.array([point_in_polygon(x, y, poly) for (x, y) in pts_jit], dtype=bool)
+        pts[in_mask] = pts_jit[in_mask]
+
+    return pts
+
+def unique_rows(a: np.ndarray, tol: float = 1e-12) -> np.ndarray:
+    """
+    Deduplicate rows with a rounding trick; good for floating grids.
+    """
+    b = np.round(a / tol).astype(np.int64)
+    _, idx = np.unique(b, axis=0, return_index=True)
+    return a[np.sort(idx)]
+
+def triangulate_points_in_polygon(pts: np.ndarray, poly: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Perform Delaunay triangulation of points, then keep triangles whose centroids
+    lie within the polygon.
+    Returns (triangles, centroids).
+    triangles: (K, 3) int indices into pts
+    centroids: (K, 2) float
+    """
+    if pts.shape[0] < 3:
+        raise RuntimeError("Not enough points to triangulate.")
+
+    tri = Delaunay(pts)
+    simplices = tri.simplices  # (K, 3)
+    # Compute centroids
+    P0 = pts[simplices[:, 0]]
+    P1 = pts[simplices[:, 1]]
+    P2 = pts[simplices[:, 2]]
+    centroids = (P0 + P1 + P2) / 3.0
+
+    # Keep only triangles whose centroid is inside the polygon
+    inside = np.array([point_in_polygon(c[0], c[1], poly) for c in centroids], dtype=bool)
+    kept = simplices[inside]
+    centroids_kept = centroids[inside]
+    return kept, centroids_kept
+
+
+# -----------------------------
+# FEM core (linear triangles)
+# -----------------------------
+
+def tri_area(p0, p1, p2) -> float:
+    """
+    Twice the signed area formula / 2 => area.
+    """
+    return 0.5 * abs(
+        (p1[0] - p0[0]) * (p2[1] - p0[1]) -
+        (p2[0] - p0[0]) * (p1[1] - p0[1])
+    )
+
+def local_stiffness_matrix_tri(nodes: np.ndarray, kappa: float) -> np.ndarray:
+    """
+    Compute the 3x3 local stiffness matrix for -kappa * Laplacian on a linear triangle.
+    Using standard formula: K_e = (kappa / (4A)) * B^T * B, with gradients of shape functions.
+    """
+    x = nodes[:, 0]
+    y = nodes[:, 1]
+
+    # Shape function gradients via area coordinates
+    # N1 = a1 + b1*x + c1*y, etc.; but a more direct way:
+    b = np.array([y[1] - y[2], y[2] - y[0], y[0] - y[1]])
+    c = np.array([x[2] - x[1], x[0] - x[2], x[1] - x[0]])
+
+    A2 = (x[1] - x[0]) * (y[2] - y[0]) - (x[2] - x[0]) * (y[1] - y[0])
+    area = 0.5 * abs(A2) + 1e-30
+
+    # Grad(Ni) = [bi, ci]/(2A)
+    # K_ij = kappa * (bi*bj + ci*cj) / (4A)
+    K = np.zeros((3, 3))
+    for i in range(3):
+        for j in range(3):
+            K[i, j] = kappa * (b[i] * b[j] + c[i] * c[j]) / (4.0 * area)
+    return K, area
+
+def assemble_global(pts: np.ndarray,
+                    tris: np.ndarray,
+                    source_Q: float,
+                    kappa: float) -> Tuple[csr_matrix, np.ndarray]:
+    """
+    Assemble global stiffness matrix K and load vector f for:
+        -kappa * Laplacian(T) = Q
+    with piecewise-constant source Q (constant here).
+    """
+    n = pts.shape[0]
+    I = []
+    J = []
+    V = []
+    f = np.zeros(n)
+
+    for elem in tris:
+        nodes = pts[elem]
+        Ke, area = local_stiffness_matrix_tri(nodes, kappa=kappa)
+        # Load vector due to source term Q (integral N_i * Q dΩ) = Q * area/3 per node
+        fe = np.full(3, source_Q * area / 3.0)
+
+        for a_local, a_global in enumerate(elem):
+            f[a_global] += fe[a_local]
+            for b_local, b_global in enumerate(elem):
+                I.append(a_global)
+                J.append(b_global)
+                V.append(Ke[a_local, b_local])
+
+    K = coo_matrix((V, (I, J)), shape=(n, n)).tocsr()
+    return K, f
+
+def identify_boundary_nodes(pts: np.ndarray, poly: np.ndarray, tol=1e-6) -> np.ndarray:
+    """
+    Return a boolean mask of nodes that lie on the polygon boundary within tolerance.
+    """
+    mask = np.zeros(pts.shape[0], dtype=bool)
+    for i, (x, y) in enumerate(pts):
+        if point_on_polygon_edge((x, y), poly, tol=tol):
+            mask[i] = True
+    return mask
+
+def boundary_nodes_by_x(pts: np.ndarray, x_value: float, tol=1e-6) -> np.ndarray:
+    """
+    Return node indices whose x is close to x_value (vertical boundary).
+    """
+    return np.where(np.abs(pts[:, 0] - x_value) <= tol)[0]
+
+def apply_dirichlet_bc(K: csr_matrix, f: np.ndarray, fixed_idx: np.ndarray, fixed_values: np.ndarray) -> Tuple[csr_matrix, np.ndarray]:
+    """
+    Apply Dirichlet boundary conditions by row/column elimination.
+    For rows corresponding to fixed nodes i:
+       K[i, :] = 0; K[i, i] = 1; f[i] = T_fixed[i]
+    Also adjust RHS for other rows: f -= K[:, fixed]*T_fixed at unfixed rows (implicit with zeroing columns).
+    This implementation sets rows then zeroes columns and restores diagonal.
+    """
+    n = K.shape[0]
+    fixed = np.array(fixed_idx, dtype=int)
+    Tfixed = np.array(fixed_values, dtype=float)
+    # Safety
+    assert fixed.shape[0] == Tfixed.shape[0]
+
+    # Convert to LIL for efficient row/col operations
+    K_mod = K.tolil()
+    # For rows: enforce T = value
+    for i, val in zip(fixed, Tfixed):
+        # subtract existing column contributions to RHS (because we'll zero columns)
+        col = K_mod[:, i].toarray().ravel()
+        f -= col * val
+
+    # Now zero rows and cols, set diagonal to 1, set f[i]=value
+    for i, val in zip(fixed, Tfixed):
+        K_mod.rows[i] = [i]
+        K_mod.data[i] = [1.0]
+        f[i] = val
+
+    # Zero columns (except diagonal already handled)
+    for i in fixed:
+        K_mod[:, i] = 0.0
+        K_mod[i, i] = 1.0  # keep diagonal
+
+    return K_mod.tocsr(), f
+
+
+# -----------------------------
+# Heat flux post-processing
+# -----------------------------
+
+def element_grad_T(nodes: np.ndarray, T: np.ndarray) -> np.ndarray:
+    """
+    Compute constant grad(T) over a linear triangle.
+    T: (3,) nodal values in the same order as 'nodes'.
+    Returns gradient vector [dT/dx, dT/dy].
+    """
+    x = nodes[:, 0]
+    y = nodes[:, 1]
+
+    # Gradients of shape functions
+    b = np.array([y[1] - y[2], y[2] - y[0], y[0] - y[1]])
+    c = np.array([x[2] - x[1], x[0] - x[2], x[1] - x[0]])
+    A2 = (x[1] - x[0]) * (y[2] - y[0]) - (x[2] - x[0]) * (y[1] - y[0])
+    area = 0.5 * abs(A2) + 1e-30
+
+    grad = np.zeros(2)
+    # T = sum_i N_i * T_i, grad(T) = sum_i grad(N_i) * T_i
+    for i in range(3):
+        grad += np.array([b[i], c[i]]) * T[i] / (2.0 * area)
+    return grad
+
+def compute_element_fluxes(pts: np.ndarray, tris: np.ndarray, T: np.ndarray, kappa: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    For each triangle, compute grad(T) and heat flux q = -kappa * grad(T),
+    and return element-wise |q| and centroids.
+    """
+    qmag = np.zeros(tris.shape[0])
+    cent = np.zeros((tris.shape[0], 2))
+    for eidx, elem in enumerate(tris):
+        nodes = pts[elem]
+        Te = T[elem]
+        gradT = element_grad_T(nodes, Te)
+        q = -kappa * gradT
+        qmag[eidx] = np.linalg.norm(q)
+        cent[eidx] = nodes.mean(axis=0)
+    return qmag, cent
+
+
+# -----------------------------
+# Visualization
+# -----------------------------
+
+def plot_mesh(pts: np.ndarray, tris: np.ndarray, poly: np.ndarray, ax=None):
+    """
+    Draw mesh edges and the outer polygon.
+    """
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(7, 4))
+    # Tri edges
+    segments = []
+    for tri in tris:
+        a, b, c = tri
+        segments += [
+            (pts[a], pts[b]),
+            (pts[b], pts[c]),
+            (pts[c], pts[a]),
+        ]
+    lc = LineCollection(segments, colors='k', linewidths=0.3, alpha=0.5)
+    ax.add_collection(lc)
+
+    # Polygon outline
+    ax.plot(poly[:, 0], poly[:, 1], 'r-', lw=2.0, label='L-bracket boundary')
+
+    ax.autoscale()
+    ax.set_aspect('equal')
+    ax.set_title('Triangular Mesh')
+    ax.legend(loc='best')
+    ax.set_xlabel('x')
+    ax.set_ylabel('y')
+    return ax
+
+def plot_temperature(pts: np.ndarray, tris: np.ndarray, T: np.ndarray, poly: np.ndarray, title='Temperature'):
+    """
+    Filled triangular contour plot for nodal scalar field T.
+    """
+    fig, ax = plt.subplots(figsize=(7, 4))
+    # Tri collection colored by nodal average (matplotlib's tricontourf needs triangulation).
+    triang = plt.tri.Triangulation(pts[:, 0], pts[:, 1], tris)
+    tpc = ax.tricontourf(triang, T, levels=30, cmap='inferno')
+    cbar = fig.colorbar(tpc, ax=ax)
+    cbar.set_label('Temperature')
+    # Boundary
+    ax.plot(poly[:, 0], poly[:, 1], 'w--', lw=1.0, alpha=0.9)
+    ax.set_aspect('equal')
+    ax.set_title(title)
+    ax.set_xlabel('x')
+    ax.set_ylabel('y')
+    plt.tight_layout()
+    plt.show()
+
+def plot_flux_magnitude(tris: np.ndarray, centroids: np.ndarray, qmag: np.ndarray, poly: np.ndarray, title='Heat Flux Magnitude |q|'):
+    """
+    Scatter plot of |q| at element centroids over the domain.
+    """
+    fig, ax = plt.subplots(figsize=(7, 4))
+    sc = ax.scatter(centroids[:, 0], centroids[:, 1], c=qmag, s=12, cmap='viridis')
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label('|q|')
+    ax.plot(poly[:, 0], poly[:, 1], 'k-', lw=1.0)
+    ax.set_aspect('equal')
+    ax.set_title(title)
+    ax.set_xlabel('x')
+    ax.set_ylabel('y')
+    plt.tight_layout()
+    plt.show()
+
+
+# -----------------------------
+# CSV export
+# -----------------------------
+
+def write_csv_nodal(path: str, pts: np.ndarray, T: np.ndarray, qnodal: Optional[np.ndarray] = None):
+    """
+    Write nodal fields to CSV.
+    Columns: id, x, y, T, (optional) qmag_nodal
+    """
+    with open(path, 'w', newline='') as f:
+        w = csv.writer(f)
+        header = ['id', 'x', 'y', 'T']
+        if qnodal is not None:
+            header.append('qmag_nodal')
+        w.writerow(header)
+        for i, (xy, Ti) in enumerate(zip(pts, T)):
+            row = [i, xy[0], xy[1], Ti]
+            if qnodal is not None:
+                row.append(qnodal[i])
+            w.writerow(row)
+
+
+# -----------------------------
+# Main driver
+# -----------------------------
+
+def run_simulation():
+    # ---- 1) Geometry (design) ----
+    gpar = LBracketParams(
+        Lx=120.0,   # width  of bracket
+        Ly=80.0,    # height of bracket
+        t=30.0,     # arm thickness
+        r_in=0.0,   # (not used in this simple polygon)
+        notch=10.0  # add a small notch at inner corner for fun
+    )
+    poly = make_l_bracket_polygon(gpar)
+
+    # ---- 2) Meshing ----
+    mpar = MeshingParams(
+        h=4.0,                       # smaller h -> finer mesh
+        boundary_points_per_edge=35, # add more samples along edges
+        jitter=0.25                  # slight randomization
+    )
+    pts = seed_points_in_polygon(poly, mpar)
+    tris, centroids = triangulate_points_in_polygon(pts, poly)
+
+    # Safety check: remove degenerate tiny-area triangles if any
+    areas = np.array([tri_area(pts[e[0]], pts[e[1]], pts[e[2]]) for e in tris])
+    good = areas > 1e-8
+    tris = tris[good]
+    centroids = centroids[good]
+
+    # ---- 3) Physics + Assembly ----
+    # Material conductivity (kappa), source term Q:
+    kappa = 45.0    # W/(m·K) or any consistent units
+    Q = 0.0         # internal heat generation (set nonzero to test)
+
+    K, f = assemble_global(pts, tris, source_Q=Q, kappa=kappa)
+
+    # ---- 4) Boundary conditions ----
+    # Dirichlet on left (x=0) -> hot; right (x=Lx) -> cold; others insulated
+    tol = 1e-6
+    left_nodes = boundary_nodes_by_x(pts, x_value=0.0, tol=tol)
+    right_nodes = boundary_nodes_by_x(pts, x_value=gpar.Lx, tol=tol)
+
+    T_left = 100.0  # °C
+    T_right = 20.0  # °C
+
+    fixed_idx = np.concatenate([left_nodes, right_nodes])
+    fixed_vals = np.concatenate([np.full_like(left_nodes, T_left, dtype=float),
+                                 np.full_like(right_nodes, T_right, dtype=float)])
+
+    Kbc, fbc = apply_dirichlet_bc(K, f.copy(), fixed_idx=fixed_idx, fixed_values=fixed_vals)
+
+    # ---- 5) Solve ----
+    T = spsolve(Kbc, fbc)
+
+    # ---- 6) Post-processing ----
+    qmag_e, cent_e = compute_element_fluxes(pts, tris, T, kappa=kappa)
+
+    # Optionally, get a nodal flux magnitude by averaging adjacent elements
+    qmag_nodal = np.zeros(pts.shape[0])
+    counts = np.zeros(pts.shape[0])
+    for eidx, tri in enumerate(tris):
+        for a in tri:
+            qmag_nodal[a] += qmag_e[eidx]
+            counts[a] += 1.0
+    counts[counts == 0] = 1.0
+    qmag_nodal /= counts
+
+    # ---- 7) Plots ----
+    print(f"Mesh: {pts.shape[0]} nodes, {tris.shape[0]} triangles")
+    print(f"Temperature range: {T.min():.3f} .. {T.max():.3f}")
+    print(f"Mean |q| (element): {qmag_e.mean():.4f}")
+
+    # Show quick visualizations
+    fig, axs = plt.subplots(1, 2, figsize=(12, 4))
+    # Left: mesh
+    plot_mesh(pts, tris, poly, ax=axs[0])
+    axs[0].set_title('Mesh')
+
+    # Right: temperature with tricontourf
+    triang = plt.tri.Triangulation(pts[:, 0], pts[:, 1], tris)
+    tpc = axs[1].tricontourf(triang, T, levels=30, cmap='inferno')
+    plt.colorbar(tpc, ax=axs[1], label='Temperature')
+    axs[1].plot(poly[:, 0], poly[:, 1], 'w--', lw=1.0, alpha=0.8)
+    axs[1].set_aspect('equal')
+    axs[1].set_title('Temperature Field')
+
+    plt.tight_layout()
+    plt.show()
+
+    # Separate detailed plots
+    plot_temperature(pts, tris, T, poly, title='Steady-State Temperature')
+    plot_flux_magnitude(tris, cent_e, qmag_e, poly, title='Heat Flux Magnitude |q|')
+
+    # ---- 8) Export results ----
+    write_csv_nodal('l_bracket_results.csv', pts, T, qnodal=qmag_nodal)
+    print("Wrote nodal results to l_bracket_results.csv")
+
+# -----------------------------
+# Entrypoint
+# -----------------------------
+
+if __name__ == "__main__":
+    run_simulation()
