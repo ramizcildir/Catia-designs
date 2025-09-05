@@ -1,0 +1,148 @@
+"""
+geometry.py
+
+Generate a 2D mesh for an L-shaped plate with a circular hole.
+Outputs nodes (Nx2) and elements (Mx3) arrays.
+
+Notes:
+- Structured grid of quads split to triangles.
+- Remove triangles outside L-shape and inside circular hole.
+- No external CAD or CATIA dependency; this imitates a CAD-like geometry generator.
+"""
+
+import numpy as np
+
+
+def make_rect_grid(xmin, xmax, ymin, ymax, nx, ny):
+    """
+    Create a structured grid of points and triangular elements over a rectangle.
+
+    Returns:
+        nodes: (n_nodes, 2)
+        elems: (n_elems, 3)  # indices into nodes (triangles)
+    """
+    xs = np.linspace(xmin, xmax, nx + 1)
+    ys = np.linspace(ymin, ymax, ny + 1)
+    xv, yv = np.meshgrid(xs, ys)
+    nodes = np.column_stack([xv.ravel(), yv.ravel()])
+
+    # build quads then split into two triangles each
+    elems = []
+    for j in range(ny):
+        for i in range(nx):
+            # node indices in grid
+            n0 = j * (nx + 1) + i
+            n1 = n0 + 1
+            n2 = n0 + (nx + 1)
+            n3 = n2 + 1
+            # split quad into two triangles (n0, n1, n3) and (n0, n3, n2)
+            elems.append([n0, n1, n3])
+            elems.append([n0, n3, n2])
+    elems = np.array(elems, dtype=np.int64)
+    return nodes, elems
+
+
+def in_l_shape(x, y, Lx, Ly, cutx, cuty):
+    """
+    Return True for points inside an L-shaped region.
+    Lx, Ly: full rectangle extents (width, height)
+    cutx, cuty: cutout sizes from the top-right corner to make L
+    The L-shape is assumed with origin at (0,0), rectangle spanning [0,Lx]x[0,Ly]
+    """
+    # inside main rectangle
+    if x < 0 or x > Lx or y < 0 or y > Ly:
+        return False
+    # If inside the cut rectangle in top-right, then outside L
+    if (x > Lx - cutx) and (y > Ly - cuty):
+        return False
+    return True
+
+
+def make_L_plate_with_hole(Lx=2.0, Ly=1.0, cutx=0.8, cuty=0.5, hole_center=(1.2, 0.6), hole_r=0.15, nx=80, ny=40):
+    """
+    Generate nodes and triangular elements for an L-shaped plate with a circular hole.
+
+    Parameters:
+    - Lx, Ly: dimensions of the full rectangle before cutting L
+    - cutx, cuty: sizes to cut from top-right to make an L
+    - hole_center: (x,y) center of circular hole
+    - hole_r: radius of circular hole
+    - nx, ny: mesh subdivisions across x and y (controls resolution)
+
+    Returns:
+    - nodes: (N,2) float64
+    - elems: (M,3) int64
+    """
+    # base rectangular grid
+    nodes, elems = make_rect_grid(0.0, Lx, 0.0, Ly, nx, ny)
+
+    # Mask nodes inside shape
+    mask_node_keep = np.array([in_l_shape(x, y, Lx, Ly, cutx, cuty) for x, y in nodes], dtype=bool)
+
+    # mask nodes outside hole
+    hx, hy = hole_center
+    dist2 = (nodes[:, 0] - hx) ** 2 + (nodes[:, 1] - hy) ** 2
+    mask_node_keep &= (dist2 >= hole_r ** 2)  # remove nodes inside hole
+
+    # We need to remove elements that reference removed nodes
+    keep_elems = []
+    for tri in elems:
+        if mask_node_keep[tri].all():
+            # also ensure triangle centroid is inside L-shape (conservative)
+            cx = nodes[tri, 0].mean()
+            cy = nodes[tri, 1].mean()
+            if in_l_shape(cx, cy, Lx, Ly, cutx, cuty):
+                if ((cx - hx) ** 2 + (cy - hy) ** 2) >= hole_r ** 2 - 1e-12:
+                    keep_elems.append(tri)
+    keep_elems = np.array(keep_elems, dtype=np.int64)
+
+    # Now compact node indexing to remove unused nodes
+    used_nodes = np.unique(keep_elems.ravel())
+    new_index = -np.ones(nodes.shape[0], dtype=np.int64)
+    new_index[used_nodes] = np.arange(used_nodes.size)
+    nodes_new = nodes[used_nodes, :]
+    elems_new = new_index[keep_elems]
+
+    return nodes_new, elems_new
+
+
+def boundary_nodes(nodes, tol=1e-6):
+    """
+    Find boundary nodes (approximate) by checking neighbors. Simpler approach: nodes
+    lying on domain edges or near hole boundary — return indices.
+    """
+    # Build quick bounding box edges
+    xmin = nodes[:, 0].min() + tol
+    xmax = nodes[:, 0].max() - tol
+    ymin = nodes[:, 1].min() + tol
+    ymax = nodes[:, 1].max() - tol
+
+    left = np.where(np.abs(nodes[:, 0] - xmin) < 1e-8)[0]
+    right = np.where(np.abs(nodes[:, 0] - xmax) < 1e-8)[0]
+    bottom = np.where(np.abs(nodes[:, 1] - ymin) < 1e-8)[0]
+    top = np.where(np.abs(nodes[:, 1] - ymax) < 1e-8)[0]
+    return {
+        "left": left,
+        "right": right,
+        "bottom": bottom,
+        "top": top
+    }
+
+
+def save_mesh(filename, nodes, elems):
+    """
+    Save mesh to a .npz file for easy loading later.
+    """
+    np.savez_compressed(filename, nodes=nodes, elems=elems)
+    print(f"Saved mesh to {filename} (nodes={nodes.shape[0]}, elems={elems.shape[0]})")
+
+
+def load_mesh(filename):
+    d = np.load(filename)
+    return d["nodes"], d["elems"]
+
+
+if __name__ == "__main__":
+    # generate sample mesh and save
+    nodes, elems = make_L_plate_with_hole(nx=80, ny=40)
+    save_mesh("mesh.npz", nodes, elems)
