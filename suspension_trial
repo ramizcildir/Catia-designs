@@ -1,0 +1,597 @@
+"""
+spring_sim.py
+
+CATIA görüntüsüne benzer bir yay + üst/alt plakalı modelin pygame ile benzeri bir simülasyonu.
+
+Özellikler:
+- 3B benzeri görünüm için basit perspective projeksiyon ve kamera rotasyonları
+- Yay: kütle-yay (mass-spring) modeli, her nokta bir parçacık (particle)
+- Üst ve alt plakalar: basit sert gövde (rigid) gibi davranan sabit/taşınabilen yüzeyler
+- Basit verlet/explicit entegrasyon (stabil olacak şekilde hafif zaman adımı ile)
+- Kullanıcı kontrolleri: kamera, simülasyon başlat/durdur, güç uygula, sıfırla
+- Görselleştirme: tel örgü (wireframe), dolu yüzey, gösterge panelleri
+
+Gerekli: pygame
+pip install pygame
+
+Yazar: ChatGPT (Phython Programming Tutor)
+Tarih: 2025-09
+"""
+
+import pygame
+import math
+import random
+import sys
+import time
+
+# ---------------------------------------------------------------------
+# Basit vektör yardımcıları (3D)
+# Bu bağımsız fonksiyon seti, numpy kullanmadan vektör işlemlerini sağlar.
+# ---------------------------------------------------------------------
+def vadd(a, b):
+    return [a[0]+b[0], a[1]+b[1], a[2]+b[2]]
+
+def vsub(a, b):
+    return [a[0]-b[0], a[1]-b[1], a[2]-b[2]]
+
+def vmul(a, s):
+    return [a[0]*s, a[1]*s, a[2]*s]
+
+def vdiv(a, s):
+    return [a[0]/s, a[1]/s, a[2]/s]
+
+def vlen(a):
+    return math.sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2])
+
+def vnorm(a):
+    L = vlen(a)
+    if L == 0:
+        return [0.0,0.0,0.0]
+    return [a[0]/L, a[1]/L, a[2]/L]
+
+def vdot(a, b):
+    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
+
+def vcross(a, b):
+    return [
+        a[1]*b[2] - a[2]*b[1],
+        a[2]*b[0] - a[0]*b[2],
+        a[0]*b[1] - a[1]*b[0]
+    ]
+
+# ---------------------------------------------------------------------
+# 3D -> 2D projection (perspective)
+# Basit kamera modelimiz: position + rotation (yaw, pitch, roll)
+# ---------------------------------------------------------------------
+class Camera:
+    def __init__(self, pos=[0,0,-200], yaw=0.0, pitch=0.0, fov=60, screen_size=(1200,700)):
+        self.pos = list(pos)
+        self.yaw = yaw
+        self.pitch = pitch
+        self.roll = 0.0
+        self.fov = fov
+        self.screen_size = screen_size
+        self.near = 0.1
+        self.far = 10000.0
+
+    def world_to_camera(self, p):
+        # Translate by -pos
+        x,y,z = vsub(p, self.pos)
+        # Apply rotations (pitch then yaw then roll) - using simple rotation around axes
+        # pitch rotates around X axis
+        cp = math.cos(self.pitch); sp = math.sin(self.pitch)
+        x1 = x
+        y1 = y*cp - z*sp
+        z1 = y*sp + z*cp
+        # yaw rotates around Y axis
+        cy = math.cos(self.yaw); sy = math.sin(self.yaw)
+        x2 = x1*cy + z1*sy
+        y2 = y1
+        z2 = -x1*sy + z1*cy
+        # roll (usually small, not used heavily)
+        cr = math.cos(self.roll); sr = math.sin(self.roll)
+        x3 = x2*cr - y2*sr
+        y3 = x2*sr + y2*cr
+        z3 = z2
+        return [x3,y3,z3]
+
+    def project(self, p):
+        # project a 3D point to 2D screen coordinates
+        cam = self.world_to_camera(p)
+        x,y,z = cam
+        if z == 0:
+            z = 1e-5
+        # simple perspective: scale by focal length derived from fov
+        f = 1.0 / math.tan(math.radians(self.fov) / 2.0)
+        # screen center
+        w,h = self.screen_size
+        sx = (f * x / (z if z!=0 else 1)) * (w/2) + w/2
+        sy = -(f * y / (z if z!=0 else 1)) * (h/2) + h/2
+        return (sx, sy, z)
+
+# ---------------------------------------------------------------------
+# Particle - kütle noktası
+# ---------------------------------------------------------------------
+class Particle:
+    def __init__(self, pos, mass=1.0, pinned=False):
+        self.pos = list(pos)
+        self.prev = list(pos)
+        self.acc = [0.0, 0.0, 0.0]
+        self.mass = mass
+        self.inv_mass = 0.0 if pinned else 1.0 / mass
+        self.pinned = pinned
+        self.radius = 4.0  # render radius
+
+    def apply_force(self, f):
+        # f: vector
+        if not self.pinned:
+            self.acc = vadd(self.acc, vmul(f, self.inv_mass))
+
+    def integrate(self, dt, damping=0.99):
+        if self.pinned:
+            self.acc = [0.0,0.0,0.0]
+            self.prev = list(self.pos)
+            return
+        # Verlet integration
+        temp = list(self.pos)
+        velocity = vsub(self.pos, self.prev)
+        # apply damping
+        velocity = vmul(velocity, damping)
+        # new pos
+        self.pos = vadd(vadd(self.pos, velocity), vmul(self.acc, dt*dt))
+        self.prev = temp
+        self.acc = [0.0,0.0,0.0]
+
+# ---------------------------------------------------------------------
+# Spring constraint between two particles
+# Hooke's law based, but implemented as distance constraint solver
+# ---------------------------------------------------------------------
+class Spring:
+    def __init__(self, a:Particle, b:Particle, rest=None, k=1.0, damp=0.02):
+        self.a = a
+        self.b = b
+        self.k = k
+        self.damp = damp
+        if rest is None:
+            self.rest_length = vlen(vsub(a.pos,b.pos))
+        else:
+            self.rest_length = rest
+
+    def solve(self):
+        # positional constraint solving to preserve rest length
+        delta = vsub(self.b.pos, self.a.pos)
+        d = vlen(delta)
+        if d == 0:
+            return
+        diff = (d - self.rest_length)/d
+        inv_mass_sum = (0 if self.a.pinned else self.a.inv_mass) + (0 if self.b.pinned else self.b.inv_mass)
+        if inv_mass_sum == 0:
+            return
+        # compute move amounts
+        move_a = ( (0 if self.a.pinned else self.a.inv_mass) / inv_mass_sum )
+        move_b = ( (0 if self.b.pinned else self.b.inv_mass) / inv_mass_sum )
+        correction = vmul(delta, 0.5 * self.k * diff)  # factor 0.5 to avoid overcorrection
+        if not self.a.pinned:
+            self.a.pos = vadd(self.a.pos, vmul(correction, move_a))
+        if not self.b.pinned:
+            self.b.pos = vsub(self.b.pos, vmul(correction, move_b))
+
+# ---------------------------------------------------------------------
+# Rigid plate (top/bottom) - represented by a circular disk of points
+# For simplicity, we treat plate as "semi-rigid": central anchor + ring particles connected by strong springs
+# ---------------------------------------------------------------------
+class Plate:
+    def __init__(self, center, radius, thickness=6.0, segments=12, mass=5.0, pinned=False):
+        self.center = list(center)
+        self.radius = radius
+        self.thickness = thickness
+        self.segments = segments
+        self.pinned = pinned
+        # create particles in a ring + center
+        self.center_particle = Particle([center[0], center[1], center[2]], mass=mass, pinned=pinned)
+        self.ring = []
+        for i in range(segments):
+            ang = (i / segments) * math.tau
+            x = center[0] + radius * math.cos(ang)
+            y = center[1] + radius * math.sin(ang)
+            z = center[2]
+            p = Particle([x,y,z], mass=mass/segments, pinned=pinned)
+            self.ring.append(p)
+        # create strong springs between center and ring, and ring-to-ring
+        self.springs = []
+        for i in range(segments):
+            a = self.ring[i]
+            b = self.center_particle
+            self.springs.append(Spring(a,b, k=1.0, damp=0.01))
+        for i in range(segments):
+            a = self.ring[i]
+            b = self.ring[(i+1)%segments]
+            self.springs.append(Spring(a,b, k=1.0, damp=0.01))
+
+    def apply_force(self, f):
+        self.center_particle.apply_force(f)
+        for p in self.ring:
+            p.apply_force(vmul(f, 1.0/len(self.ring)))
+
+    def integrate(self, dt):
+        self.center_particle.integrate(dt)
+        for p in self.ring:
+            p.integrate(dt)
+
+    def solve_constraints(self, iterations=5):
+        # solve internal springs
+        for i in range(iterations):
+            for s in self.springs:
+                s.solve()
+
+# ---------------------------------------------------------------------
+# Helical spring builder
+# Create a series of particles arranged in a helix and connect neighbors with springs
+# Add radial cross connections for stability
+# ---------------------------------------------------------------------
+def build_helix(particles_list, springs_list, center=[0,0,0], radius=25.0, pitch=8.0, turns=10, points_per_turn=20, start_z=0.0):
+    total_points = int(turns * points_per_turn) + 1
+    for i in range(total_points):
+        t = i / points_per_turn
+        ang = t * math.tau
+        x = center[0] + radius * math.cos(ang)
+        y = center[1] + radius * math.sin(ang)
+        z = start_z + t * pitch
+        p = Particle([x,y,z], mass=0.5, pinned=False)
+        particles_list.append(p)
+        # connect to previous
+        if i > 0:
+            s = Spring(particles_list[i-1], particles_list[i], k=0.9, damp=0.02)
+            springs_list.append(s)
+            # also add a longer-range spring every few points to keep helix shape stable
+            if i > 1:
+                s2 = Spring(particles_list[i-2], particles_list[i], k=0.05, damp=0.02)
+                springs_list.append(s2)
+    # cross connections: connect each point to center axis (to approximate torsional stiffness)
+    # optional, helps keep the helix from collapsing
+    for i,p in enumerate(particles_list):
+        # compute projection onto axis (which we'll take as x=0,y=0 axis)
+        proj = [center[0], center[1], p.pos[2]]
+        # create a virtual anchor particle at axis level (not in list) by connecting softly to a fixed anchor
+        anchor = Particle(proj, mass=1000000.0, pinned=True)
+        s = Spring(p, anchor, k=0.02, damp=0.1)
+        springs_list.append(s)
+
+# ---------------------------------------------------------------------
+# PhysicsWorld - tutar tüm parçacıkları, yayları, plakaları ve integrasyonu/çözümü
+# ---------------------------------------------------------------------
+class PhysicsWorld:
+    def __init__(self, gravity=[0.0,0.0,-9.81], air_drag=0.995):
+        self.particles = []
+        self.springs = []
+        self.plates = []
+        self.gravity = gravity
+        self.air_drag = air_drag
+        self.global_iterations = 6  # constraint solver iterations
+
+    def add_particle(self, p:Particle):
+        self.particles.append(p)
+
+    def add_spring(self, s:Spring):
+        self.springs.append(s)
+
+    def add_plate(self, plate:Plate):
+        self.plates.append(plate)
+        # add plate particles to world lists for convenience
+        self.particles.append(plate.center_particle)
+        for r in plate.ring:
+            self.particles.append(r)
+        for s in plate.springs:
+            self.springs.append(s)
+
+    def step(self, dt):
+        # Apply gravity
+        for p in self.particles:
+            if not p.pinned:
+                p.apply_force(vmul(self.gravity, p.mass))
+                # small global air drag applied during integration by damping parameter
+
+        # integrate particles
+        for p in self.particles:
+            p.integrate(dt, damping=self.air_drag)
+
+        # Solve constraints (springs)
+        for _ in range(self.global_iterations):
+            for s in self.springs:
+                s.solve()
+            # also solve plate internal constraints separately
+            for pl in self.plates:
+                pl.solve_constraints(iterations=1)
+
+    def clear(self):
+        self.particles.clear()
+        self.springs.clear()
+        self.plates.clear()
+
+# ---------------------------------------------------------------------
+# Renderer: draws particles, springs, and plates using camera projection
+# ---------------------------------------------------------------------
+class Renderer:
+    def __init__(self, screen, camera:Camera):
+        self.screen = screen
+        self.camera = camera
+        self.width, self.height = screen.get_size()
+        self.show_wire = True
+        self.show_particles = True
+        self.show_plates = True
+
+    def world_to_screen(self, p):
+        sx, sy, z = self.camera.project(p)
+        return (int(sx), int(sy), z)
+
+    def draw_particle(self, p:Particle, color=(255,220,0)):
+        sx, sy, z = self.world_to_screen(p.pos)
+        if z < 0:  # point is behind camera, skip
+            return
+        r = int(max(1, p.radius * (200.0 / (z+200.0))))
+        pygame.draw.circle(self.screen, color, (sx, sy), r)
+
+    def draw_spring(self, s:Spring, color=(200,200,200)):
+        a = s.a.pos; b = s.b.pos
+        pa = self.world_to_screen(a); pb = self.world_to_screen(b)
+        if pa[2] < -10 or pb[2] < -10:
+            return
+        # thickness according to depth
+        t = int(max(1, 2 * (200.0 / ( (pa[2]+pb[2])/2 + 200.0 ))))
+        pygame.draw.line(self.screen, color, (pa[0], pa[1]), (pb[0], pb[1]), t)
+
+    def draw_plate(self, plate:Plate, color=(120,160,240)):
+        # draw ring as polygon and center
+        pts = []
+        zs = []
+        for p in plate.ring:
+            sx,sy,z = self.world_to_screen(p.pos)
+            pts.append((sx,sy)); zs.append(z)
+        if len(pts) >= 3:
+            # compute shading based on average depth
+            avgz = sum(zs)/len(zs)
+            shade = max(30, min(200, int(200 - (avgz/100.0)*150)))
+            fill_color = (color[0]*shade//255, color[1]*shade//255, color[2]*shade//255)
+            # optionally draw filled polygon if points are in front of camera
+            if all(z > -50 for z in zs):
+                try:
+                    pygame.draw.polygon(self.screen, fill_color, pts)
+                except Exception:
+                    pass
+            # outline
+            pygame.draw.polygon(self.screen, (30,30,30), pts, 2)
+        # center
+        self.draw_particle(plate.center_particle, color=(180,100,100))
+
+    def render(self, world:PhysicsWorld, show_springs=True):
+        # clear
+        self.screen.fill((28,38,64))
+        # draw grid / floor
+        self.draw_floor()
+        # draw springs
+        if show_springs:
+            for s in world.springs:
+                self.draw_spring(s)
+        # draw plates
+        for pl in world.plates:
+            if self.show_plates:
+                self.draw_plate(pl)
+        # draw particles
+        if self.show_particles:
+            for p in world.particles:
+                self.draw_particle(p, color=(240,220,130))
+        # HUD
+        self.draw_hud(world)
+        pygame.display.flip()
+
+    def draw_floor(self):
+        # simple horizon rectangle
+        w,h = self.width, self.height
+        # gradient for background
+        for i in range(6):
+            rect = pygame.Rect(0, int(h*0.6) + i*5, w, 6)
+            color = (20+i*8, 30+i*6, 50+i*5)
+            pygame.draw.rect(self.screen, color, rect)
+
+    def draw_hud(self, world):
+        font = pygame.font.SysFont("Arial", 14)
+        lines = [
+            "Controls: Arrow keys rotate camera | W/S A/D translate | +/- zoom | Space pause | R reset | F impulsive force | C toggle springs",
+            f"Particles: {len(world.particles)}  Springs: {len(world.springs)}  Plates: {len(world.plates)}",
+            f"Camera yaw: {round(math.degrees(self.camera.yaw),1)} pitch: {round(math.degrees(self.camera.pitch),1)} pos: {tuple(round(x,1) for x in self.camera.pos)}"
+        ]
+        y = 8
+        for l in lines:
+            surf = font.render(l, True, (240,240,240))
+            self.screen.blit(surf, (8,y))
+            y += 18
+
+# ---------------------------------------------------------------------
+# High-level Simulation Setup
+# Creates world, helix, plates, attaches ends, sets initial conditions
+# ---------------------------------------------------------------------
+def create_simulation():
+    world = PhysicsWorld(gravity=[0,0,-80.0], air_drag=0.995)
+    # build helix
+    helix_particles = []
+    helix_springs = []
+    helix_center = [0.0, 0.0, 0.0]
+    build_helix(helix_particles, helix_springs, center=helix_center, radius=25.0, pitch=6.0, turns=10, points_per_turn=12, start_z=0.0)
+    # add particles/springs to world
+    for p in helix_particles:
+        world.add_particle(p)
+    for s in helix_springs:
+        world.add_spring(s)
+    # create bottom plate and pin it (clamped)
+    bottom_plate = Plate(center=[0.0,0.0,-6.0], radius=40.0, segments=20, pinned=True)
+    world.add_plate(bottom_plate)
+    # anchor bottom-most helix particle to bottom plate center (pinned)
+    if len(helix_particles) > 0:
+        bottom_particle = helix_particles[0]
+        # pin bottom particle to bottom plate center
+        bottom_particle.pinned = True
+        bottom_particle.pos = list(bottom_plate.center_particle.pos)
+        bottom_particle.prev = list(bottom_particle.pos)
+
+    # create top plate (movable)
+    top_plate = Plate(center=[0.0,0.0, (len(helix_particles)/12.0)*6.0 + 6.0], radius=40.0, segments=20, pinned=False)
+    world.add_plate(top_plate)
+    # anchor top-most helix particle to top plate center with a strong spring
+    top_particle = helix_particles[-1]
+    s_top = Spring(top_particle, top_plate.center_particle, k=1.2, damp=0.02)
+    world.add_spring(s_top)
+    # create a few radial springs between helix and plates for stability
+    for i in range(0, len(helix_particles), max(1, len(helix_particles)//6)):
+        p = helix_particles[i]
+        # connect to bottom ring and top ring some times
+        if i < len(helix_particles)//3:
+            s = Spring(p, bottom_plate.ring[i % bottom_plate.segments], k=0.05, damp=0.02)
+            world.add_spring(s)
+        elif i > 2*len(helix_particles)//3:
+            s = Spring(p, top_plate.ring[i % top_plate.segments], k=0.05, damp=0.02)
+            world.add_spring(s)
+
+    # small initial random jitter to break perfect symmetry
+    for p in world.particles:
+        if not p.pinned:
+            jitter = [random.uniform(-0.02,0.02) for _ in range(3)]
+            p.pos = vadd(p.pos, jitter)
+            p.prev = list(p.pos)
+
+    # return structure
+    return world, helix_particles, bottom_plate, top_plate
+
+# ---------------------------------------------------------------------
+# Main Application Loop
+# ---------------------------------------------------------------------
+def main():
+    pygame.init()
+    screen_size = (1240, 780)
+    screen = pygame.display.set_mode(screen_size)
+    pygame.display.set_caption("Helical Spring Simulation - CATIA benzeri (pygame)")
+    clock = pygame.time.Clock()
+    cam = Camera(pos=[-120.0, -120.0, 200.0], yaw=math.radians(45), pitch=math.radians(-30), fov=55, screen_size=screen_size)
+    renderer = Renderer(screen, cam)
+
+    # create physics world
+    world, helix_particles, bottom_plate, top_plate = create_simulation()
+
+    paused = False
+    show_springs = True
+    apply_pulse = False
+    last_pulse_time = 0.0
+
+    sim_dt = 0.016  # fixed dt for stability (~60Hz)
+    accumulated = 0.0
+
+    running = True
+    steps = 0
+
+    # For mouse interaction (drag to rotate)
+    mouse_down = False
+    last_mouse = (0,0)
+
+    # helpful instructions printed to console
+    print("Simülasyon başladı. Kontroller: Ok tuşları (kamera), W/S A/D (translate), Space duraklat/başlat, R sıfırla, F impuls kuvvet, C spring toggle, ESC çıkış")
+
+    # main loop
+    while running:
+        dt = clock.tick(60) / 1000.0
+        accumulated += dt
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                elif event.key == pygame.K_SPACE:
+                    paused = not paused
+                elif event.key == pygame.K_r:
+                    # reset
+                    world, helix_particles, bottom_plate, top_plate = create_simulation()
+                    print("Reset yapıldı.")
+                elif event.key == pygame.K_c:
+                    show_springs = not show_springs
+                elif event.key == pygame.K_f:
+                    # impulsive force: push top plate downward briefly
+                    apply_pulse = True
+                    last_pulse_time = time.time()
+                elif event.key == pygame.K_PLUS or event.key == pygame.K_EQUALS:
+                    cam.pos = vadd(cam.pos, [0,0,10])
+                elif event.key == pygame.K_MINUS or event.key == pygame.K_UNDERSCORE:
+                    cam.pos = vadd(cam.pos, [0,0,-10])
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1:
+                    mouse_down = True
+                    last_mouse = event.pos
+                elif event.button == 4:
+                    cam.pos = vadd(cam.pos, vmul([0,0,1], 8.0))
+                elif event.button == 5:
+                    cam.pos = vadd(cam.pos, vmul([0,0,-1], 8.0))
+            elif event.type == pygame.MOUSEBUTTONUP:
+                if event.button == 1:
+                    mouse_down = False
+            elif event.type == pygame.MOUSEMOTION:
+                if mouse_down:
+                    dx = event.pos[0] - last_mouse[0]
+                    dy = event.pos[1] - last_mouse[1]
+                    last_mouse = event.pos
+                    cam.yaw += dx * 0.01
+                    cam.pitch += dy * 0.01
+
+        keys = pygame.key.get_pressed()
+        # camera translations/rotations
+        if keys[pygame.K_LEFT]:
+            cam.yaw -= 0.03
+        if keys[pygame.K_RIGHT]:
+            cam.yaw += 0.03
+        if keys[pygame.K_UP]:
+            cam.pitch -= 0.03
+        if keys[pygame.K_DOWN]:
+            cam.pitch += 0.03
+        if keys[pygame.K_a]:
+            # strafe left in camera local coordinates
+            cam.pos[0] -= 4.0 * math.cos(cam.yaw)
+            cam.pos[1] -= 4.0 * math.sin(cam.yaw)
+        if keys[pygame.K_d]:
+            cam.pos[0] += 4.0 * math.cos(cam.yaw)
+            cam.pos[1] += 4.0 * math.sin(cam.yaw)
+        if keys[pygame.K_w]:
+            cam.pos[2] += 6.0
+        if keys[pygame.K_s]:
+            cam.pos[2] -= 6.0
+
+        # apply pulse if requested
+        if apply_pulse:
+            if time.time() - last_pulse_time < 0.15:  # short impulse
+                # push top plate downward
+                impulse = [0.0, 0.0, -18000.0]  # large impulse
+                top_plate.apply_force(impulse)
+                # also apply to top plate center particle
+                top_plate.center_particle.apply_force(impulse)
+            else:
+                apply_pulse = False
+
+        # step simulation fixed steps for stability
+        if not paused:
+            # we cap the update steps to a few per frame
+            num_steps = 0
+            while accumulated >= sim_dt and num_steps < 6:
+                world.step(sim_dt)
+                accumulated -= sim_dt
+                num_steps += 1
+                steps += 1
+
+        # render
+        renderer.show_wire = show_springs
+        renderer.render(world, show_springs=show_springs)
+
+    pygame.quit()
+    sys.exit()
+
+# ---------------------------------------------------------------------
+# If run as script, start main
+# ---------------------------------------------------------------------
+if __name__ == "__main__":
+    main()
